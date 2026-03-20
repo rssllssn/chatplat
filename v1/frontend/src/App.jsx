@@ -1,21 +1,20 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase } from './lib/supabase'
-import { io } from 'socket.io-client'
-
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001'
 
 function App() {
   const [user, setUser] = useState(null)
   const [profile, setProfile] = useState(null)
   const [displayName, setDisplayName] = useState('')
   const [isEditingName, setIsEditingName] = useState(false)
-  const [socket, setSocket] = useState(null)
   const [status, setStatus] = useState('idle')
   const [roomId, setRoomId] = useState(null)
   const [partnerName, setPartnerName] = useState('')
   const [messages, setMessages] = useState([])
   const [inputMessage, setInputMessage] = useState('')
   const messagesEndRef = useRef(null)
+  const roomSubscriptionRef = useRef(null)
+  const messageSubscriptionRef = useRef(null)
+  const pollIntervalRef = useRef(null)
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -36,59 +35,132 @@ function App() {
   }, [user])
 
   useEffect(() => {
-    if (user && profile) {
-      const newSocket = io(SOCKET_URL)
-      setSocket(newSocket)
-
-      newSocket.on('connect', () => {
-        newSocket.emit('authenticate', {
-          userId: user.id,
-          displayName: profile.display_name
-        })
-      })
-
-      newSocket.on('searching', () => {
-        setStatus('searching')
-        setMessages([])
-        setRoomId(null)
-        setPartnerName('')
-      })
-
-      newSocket.on('matched', ({ roomId: newRoomId, partnerName: newPartnerName }) => {
-        setStatus('matched')
-        setRoomId(newRoomId)
-        setPartnerName(newPartnerName)
-        setMessages([])
-      })
-
-      newSocket.on('receive_message', ({ message, senderName, timestamp }) => {
-        setMessages(prev => [...prev, {
-          text: message,
-          sender: 'partner',
-          senderName,
-          timestamp
-        }])
-      })
-
-      newSocket.on('partner_left', () => {
-        setStatus('partner_left')
-        setTimeout(() => {
-          setStatus('idle')
-          setRoomId(null)
-          setPartnerName('')
-          setMessages([])
-        }, 2000)
-      })
-
-      return () => {
-        newSocket.disconnect()
-      }
-    }
-  }, [user, profile])
-
-  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  useEffect(() => {
+    return () => {
+      cleanupSubscriptions()
+    }
+  }, [])
+
+  const cleanupSubscriptions = () => {
+    if (roomSubscriptionRef.current) {
+      supabase.removeChannel(roomSubscriptionRef.current)
+      roomSubscriptionRef.current = null
+    }
+    if (messageSubscriptionRef.current) {
+      supabase.removeChannel(messageSubscriptionRef.current)
+      messageSubscriptionRef.current = null
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+  }
+
+  const subscribeToRoom = useCallback((activeRoomId) => {
+    if (roomSubscriptionRef.current) {
+      supabase.removeChannel(roomSubscriptionRef.current)
+    }
+
+    const channel = supabase
+      .channel(`room-${activeRoomId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'rooms',
+          filter: `id=eq.${activeRoomId}`
+        },
+        (payload) => {
+          if (payload.new.status === 'ended') {
+            cleanupSubscriptions()
+            setStatus('partner_left')
+            setTimeout(() => {
+              setStatus('idle')
+              setRoomId(null)
+              setPartnerName('')
+              setMessages([])
+            }, 2000)
+          }
+        }
+      )
+      .subscribe()
+
+    roomSubscriptionRef.current = channel
+  }, [])
+
+  const subscribeToMessages = useCallback((activeRoomId, currentUserId) => {
+    if (messageSubscriptionRef.current) {
+      supabase.removeChannel(messageSubscriptionRef.current)
+    }
+
+    const channel = supabase
+      .channel(`messages-${activeRoomId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `room_id=eq.${activeRoomId}`
+        },
+        (payload) => {
+          if (payload.new.sender_id !== currentUserId) {
+            setMessages(prev => [...prev, {
+              text: payload.new.text,
+              sender: 'partner',
+              senderName: payload.new.sender_name,
+              timestamp: new Date(payload.new.created_at).getTime()
+            }])
+          }
+        }
+      )
+      .subscribe()
+
+    messageSubscriptionRef.current = channel
+  }, [])
+
+  const listenForIncomingMatch = useCallback((currentUserId) => {
+    if (roomSubscriptionRef.current) {
+      supabase.removeChannel(roomSubscriptionRef.current)
+    }
+
+    const channel = supabase
+      .channel('incoming-match')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'rooms',
+          filter: `user1_id=eq.${currentUserId}`
+        },
+        (payload) => {
+          const room = payload.new
+          if (room.status === 'active') {
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current)
+              pollIntervalRef.current = null
+            }
+            supabase.removeChannel(channel)
+
+            setRoomId(room.id)
+            setPartnerName(room.user2_display_name)
+            setStatus('matched')
+            setMessages([])
+
+            subscribeToRoom(room.id)
+            subscribeToMessages(room.id, currentUserId)
+          }
+        }
+      )
+      .subscribe()
+
+    roomSubscriptionRef.current = channel
+  }, [subscribeToRoom, subscribeToMessages])
 
   const loadProfile = async () => {
     const { data, error } = await supabase
@@ -124,10 +196,14 @@ function App() {
   }
 
   const signOut = async () => {
+    cleanupSubscriptions()
+    await supabase.from('queue').delete().eq('user_id', user.id)
     await supabase.auth.signOut()
     setProfile(null)
     setStatus('idle')
     setMessages([])
+    setRoomId(null)
+    setPartnerName('')
   }
 
   const updateDisplayName = async () => {
@@ -146,34 +222,88 @@ function App() {
     }
   }
 
-  const findMatch = () => {
-    if (socket) {
-      socket.emit('find_match')
-    }
-  }
+  const findMatch = async () => {
+    if (!user || !profile) return
 
-  const skipPartner = () => {
-    if (socket && roomId) {
-      socket.emit('next', { roomId })
-    }
-  }
+    setStatus('searching')
+    setMessages([])
+    setRoomId(null)
+    setPartnerName('')
 
-  const sendMessage = (e) => {
-    e.preventDefault()
-    if (!inputMessage.trim() || !socket || !roomId) return
+    await supabase.from('queue').delete().eq('user_id', user.id)
 
-    socket.emit('send_message', {
-      roomId,
-      message: inputMessage.trim()
+    await supabase.from('queue').insert({
+      user_id: user.id,
+      display_name: profile.display_name,
+      status: 'waiting'
     })
 
+    listenForIncomingMatch(user.id)
+
+    const attemptMatch = async () => {
+      const { data } = await supabase.rpc('find_match', {
+        current_user_id: user.id,
+        current_display_name: profile.display_name
+      })
+
+      if (data && data.matched) {
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current)
+          pollIntervalRef.current = null
+        }
+        cleanupSubscriptions()
+
+        setRoomId(data.room_id)
+        setPartnerName(data.partner_name)
+        setStatus('matched')
+        setMessages([])
+
+        subscribeToRoom(data.room_id)
+        subscribeToMessages(data.room_id, user.id)
+      }
+    }
+
+    await attemptMatch()
+
+    pollIntervalRef.current = setInterval(attemptMatch, 3000)
+  }
+
+  const skipPartner = async () => {
+    if (!roomId) return
+
+    cleanupSubscriptions()
+
+    await supabase
+      .from('rooms')
+      .update({ status: 'ended' })
+      .eq('id', roomId)
+
+    setRoomId(null)
+    setPartnerName('')
+    setMessages([])
+
+    findMatch()
+  }
+
+  const sendMessage = async (e) => {
+    e.preventDefault()
+    if (!inputMessage.trim() || !roomId) return
+
+    const messageText = inputMessage.trim()
+    setInputMessage('')
+
     setMessages(prev => [...prev, {
-      text: inputMessage.trim(),
+      text: messageText,
       sender: 'me',
       timestamp: Date.now()
     }])
 
-    setInputMessage('')
+    await supabase.from('messages').insert({
+      room_id: roomId,
+      sender_id: user.id,
+      sender_name: profile.display_name,
+      text: messageText
+    })
   }
 
   if (!user) {
