@@ -39,3 +39,5 @@ Before deploying, make sure you've done these in your Supabase project:
    - Redirect URLs: `https://your-app.vercel.app`
 5. **Update Google OAuth redirect URI** — In Google Cloud Console, add:
    - `https://your-project.supabase.co/auth/v1/callback`
+
+done!
