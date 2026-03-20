@@ -62,6 +62,12 @@ function App() {
       clearInterval(pollIntervalRef.current)
       pollIntervalRef.current = null
     }
+    // Also clean up any other channels
+    supabase.getChannels().forEach(channel => {
+      if (channel !== roomSubscriptionRef.current && channel !== messageSubscriptionRef.current) {
+        supabase.removeChannel(channel)
+      }
+    })
   }
 
   const subscribeToRoom = useCallback((activeRoomId) => {
@@ -113,6 +119,7 @@ function App() {
           filter: `room_id=eq.${activeRoomId}`
         },
         (payload) => {
+          console.log('New message received:', payload.new)
           if (payload.new.sender_id !== currentUserId) {
             setMessages(prev => [...prev, {
               text: payload.new.text,
@@ -123,7 +130,9 @@ function App() {
           }
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        console.log('Message subscription status:', status)
+      })
 
     messageSubscriptionRef.current = channel
   }, [])
@@ -132,6 +141,8 @@ function App() {
     if (roomSubscriptionRef.current) {
       supabase.removeChannel(roomSubscriptionRef.current)
     }
+
+    console.log('Setting up incoming match listener for user:', currentUserId)
 
     const channel = supabase
       .channel('incoming-match')
@@ -144,8 +155,10 @@ function App() {
           filter: `user1_id=eq.${currentUserId}`
         },
         (payload) => {
+          console.log('Incoming match received:', payload.new)
           const room = payload.new
           if (room.status === 'active') {
+            console.log('Match found! Setting up room:', room.id)
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current)
               pollIntervalRef.current = null
@@ -162,7 +175,9 @@ function App() {
           }
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        console.log('Incoming match subscription status:', status)
+      })
 
     roomSubscriptionRef.current = channel
   }, [subscribeToRoom, subscribeToMessages])
@@ -262,6 +277,7 @@ function App() {
   const findMatch = async () => {
     if (!user || !profile) return
 
+    console.log('Finding match for user:', user.id, 'display name:', profile.display_name)
     setStatus('searching')
     setMessages([])
     setRoomId(null)
@@ -269,20 +285,69 @@ function App() {
 
     await supabase.from('queue').delete().eq('user_id', user.id)
 
-    await supabase.from('queue').insert({
+    const { data: queueData, error: queueError } = await supabase.from('queue').insert({
       user_id: user.id,
       display_name: profile.display_name,
       status: 'waiting'
-    })
+    }).select()
 
+    if (queueError) {
+      console.error('Error joining queue:', queueError)
+      return
+    }
+    console.log('Joined queue:', queueData)
+
+    // Listen for incoming matches (when we're user1)
     listenForIncomingMatch(user.id)
 
+    // Also listen for when we're matched as user2
+    const user2Channel = supabase
+      .channel('user2-match')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'rooms',
+          filter: `user2_id=eq.${user.id}`
+        },
+        (payload) => {
+          console.log('Matched as user2:', payload.new)
+          const room = payload.new
+          if (room.status === 'active') {
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current)
+              pollIntervalRef.current = null
+            }
+            cleanupSubscriptions()
+
+            setRoomId(room.id)
+            setPartnerName(room.user1_display_name)
+            setStatus('matched')
+            setMessages([])
+
+            subscribeToRoom(room.id)
+            subscribeToMessages(room.id, user.id)
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log('User2 match subscription status:', status)
+      })
+
     const attemptMatch = async () => {
-      const { data } = await supabase.rpc('find_match', {
+      console.log('Attempting to find match...')
+      const { data, error } = await supabase.rpc('find_match', {
         current_user_id: user.id,
         current_display_name: profile.display_name
       })
 
+      if (error) {
+        console.error('Error in find_match RPC:', error)
+        return
+      }
+
+      console.log('Find match result:', data)
       if (data && data.matched) {
         if (pollIntervalRef.current) {
           clearInterval(pollIntervalRef.current)
@@ -290,6 +355,7 @@ function App() {
         }
         cleanupSubscriptions()
 
+        console.log('Match found via RPC:', data)
         setRoomId(data.room_id)
         setPartnerName(data.partner_name)
         setStatus('matched')
@@ -335,12 +401,20 @@ function App() {
       timestamp: Date.now()
     }])
 
-    await supabase.from('messages').insert({
+    console.log('Sending message:', { roomId, userId: user.id, text: messageText })
+    
+    const { data, error } = await supabase.from('messages').insert({
       room_id: roomId,
       sender_id: user.id,
       sender_name: profile.display_name,
       text: messageText
-    })
+    }).select()
+
+    if (error) {
+      console.error('Error sending message:', error)
+    } else {
+      console.log('Message inserted successfully:', data)
+    }
   }
 
   if (!user) {
